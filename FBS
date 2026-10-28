@@ -1,0 +1,802 @@
+#!/usr/bin/env python3
+"""
+Brain Myelin Simulator — Chat AI Interface
+Generates discharge summary + PDF report + notes + charts on each analysis.
+"""
+
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox, filedialog
+import math
+import re
+import csv
+import os
+from datetime import datetime
+
+try:
+    import matplotlib
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.figure import Figure
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+    import matplotlib.pyplot as plt
+    HAS_MPL = True
+except Exception:
+    HAS_MPL = False
+
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak, Table, TableStyle
+    from reportlab.lib import colors
+    HAS_RL = True
+except Exception:
+    HAS_RL = False
+
+PHASES = [
+    (0, 9, "Childhood", 1.15),
+    (9, 32, "Adolescence", 1.25),
+    (32, 66, "Adult", 1.00),
+    (66, 83, "Early Aging", 0.75),
+    (83, 200, "Late Aging", 0.55),
+]
+
+DEFAULTS = {
+    "age": "66", "ph": "7.40", "horm": "1.0", "ca": "1.20", "cyto": "15", "id": "0",
+    "sex": "Female", "thyroid": "Euthyroid", "symptom": "None",
+    "myelination": "Age-appropriate", "inflammation": "Low", "cognitive": "Intact",
+}
+
+REPORT_DIR = os.path.join(os.path.expanduser("~"), "Featured_Reports", "myelin_reports")
+os.makedirs(REPORT_DIR, exist_ok=True)
+
+def clear_report_dir():
+    """Keep only the current run's files by clearing previous ones."""
+    if os.path.isdir(REPORT_DIR):
+        for name in os.listdir(REPORT_DIR):
+            path = os.path.join(REPORT_DIR, name)
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+def get_phase(age):
+    for lo, hi, name, scale in PHASES:
+        if lo <= age < hi:
+            return name, scale
+    return "Late Aging", 0.55
+
+def parse_prompt(text):
+    text = text.lower()
+    age, ph, horm, id_flag = 32.0, 7.4, 1.0, 0
+    ca, cyto = 1.2, 15.0
+    patterns = {
+        "age":  r'(age|years|yrs|old)\s*[:=]?\s*([-+]?\d*\.?\d+)',
+        "ph":   r'(ph|acidity|alk|alkalinity)\s*[:=]?\s*([-+]?\d*\.?\d+)',
+        "horm": r'(hormone|horm|thyroid|sex)\s*[:=]?\s*([-+]?\d*\.?\d+)',
+        "ca":   r'(calcium|ca|ion|ca2)\s*[:=]?\s*([-+]?\d*\.?\d+)',
+        "cyto": r'(cytokine|cyto|il6|tnf|inflammation)\s*[:=]?\s*([-+]?\d*\.?\d+)',
+    }
+    for key, pat in patterns.items():
+        m = re.search(pat, text)
+        if m:
+            val = float(m.group(2).replace(",", "."))
+            if key == "age": age = val
+            elif key == "ph": ph = val
+            elif key == "horm": horm = val
+            elif key == "ca": ca = val
+            elif key == "cyto": cyto = val
+    if re.search(r'(disabled|id)\s*(true|yes|1)', text):
+        id_flag = 1
+    elif re.search(r'(disabled|id)\s*(false|no|0)', text):
+        id_flag = 0
+    else:
+        m = re.search(r'(id|disabled)\s*[:=]?\s*(\d)', text)
+        if m: id_flag = int(m.group(2))
+    return age, ph, horm, id_flag, ca, cyto
+
+def myelin_metrics(age, ph, horm, id_flag, ca, cyto):
+    peak, base = 35.0, 150.0
+    age_factor = math.exp(-0.5 * ((age - peak) / 20.0) ** 2)
+    ph_factor = 1.0 if 7.1 <= ph <= 7.5 else 0.55
+    horm_factor = max(0.4, horm)
+    id_penalty = 0.65 if id_flag else 1.0
+    ca_penalty = max(0.4, 1.0 - 0.25 * abs(ca - 1.2))
+    cyto_penalty = max(0.3, 1.0 - (cyto / 100.0))
+    thickness = base * age_factor * ph_factor * horm_factor * id_penalty * ca_penalty * cyto_penalty
+    delta = thickness - 120.0
+    g_ratio = max(0.55, min(0.95, 0.72 + (0.06 if id_flag else 0.0) - 0.08 * (delta / 50.0)))
+    vel = 4.5 * 1.8 * (1.0 / g_ratio) * math.sqrt(max(thickness, 1.0) / 100.0)
+    return thickness, delta, g_ratio, vel
+
+def nn_forward(age, ph, horm, id_flag, ca, cyto, scale):
+    W1 = [
+        [0.15, 1.2, 2.1, -1.5, -0.4, -0.05],
+        [0.05, 0.8, 0.5, -0.2, 0.9, -0.12],
+        [-0.01, 0.1, -0.3, 0.0, -0.2, 0.45],
+        [0.22, -0.4, 1.1, -0.8, 0.1, -0.30],
+    ]
+    b1 = [-1.5, 0.4, 0.15, -0.8]
+    W2 = [
+        [15.0, 5.0, -2.5, 8.0],
+        [12.5, 3.1, -1.2, 4.5],
+        [-0.02, 0.01, 0.04, -0.01],
+    ]
+    b2 = [-10.0, 5.0, 0.68]
+    age_w = scale if scale > 1.0 else (2.0 - scale)
+    x = [age * age_w, ph, horm * scale, float(id_flag), ca, cyto]
+    h1 = [max(0.0, b1[r] + sum(W1[r][c] * x[c] for c in range(6))) for r in range(4)]
+    out = [b2[r] + sum(W2[r][c] * h1[c] for c in range(4)) for r in range(3)]
+    out[0] += 2.0 if scale >= 1.0 else -12.0
+    return out
+
+def generate_discharge_summary(data):
+    age = data['age']
+    sex = data['sex']
+    thyroid = data['thyroid']
+    symptom = data['symptom']
+    myelination = data['myelination']
+    inflammation = data['inflammation']
+    cognitive = data['cognitive']
+    phase = data['phase']
+    cyto = data['cyto']
+    ca = data['ca']
+    thick = data['thick']
+    delta = data['delta']
+    g = data['g']
+    vel = data['vel']
+
+    thickness_desc = (
+        "about average for the reference peak"
+        if abs(delta) < 15
+        else ("thinner than the reference peak" if delta < 0 else "thicker than the reference peak")
+    )
+    speed_desc = (
+        "within a typical range"
+        if 4 < vel < 20
+        else ("on the slower side" if vel <= 4 else "on the faster side")
+    )
+    inflam_desc = (
+        "low and not a major concern"
+        if inflammation in ("None", "Low")
+        else "elevated and something to keep an eye on"
+    )
+    myelin_map = {
+        "Age-appropriate": "in line with what is expected for your age",
+        "Delayed": "developing more slowly than usual",
+        "Hypomyelination": "thinner than expected overall",
+        "Demyelinating": "showing signs of loss or damage",
+        "Remyelinating": "in a recovery or rebuilding phase",
+    }
+    myelin_desc = myelin_map.get(myelination, myelination.lower())
+    symptom_phrase = (
+        "no specific symptoms were reported"
+        if symptom == "None"
+        else f"the main concern noted was {symptom.lower()}"
+    )
+
+    summary = (
+        f"Discharge Summary (in everyday language): You are a {age:.0f}-year-old {sex.lower()} "
+        f"with {thyroid.lower()} thyroid function. On review, {symptom_phrase}, "
+        f"and your thinking and memory ability is described as {cognitive.lower()}. "
+        f"The protective myelin coating around your nerve fibers is currently {myelin_desc}. "
+        f"Inflammation is {inflam_desc} (cytokine level about {cyto:.0f} pg/mL). "
+        f"Calcium is at {ca:.2f} mmol/L. "
+        f"The measured myelin thickness is approximately {thick:.0f} nanometers, which is {thickness_desc}. "
+        f"Nerve signals are traveling at about {vel:.1f} meters per second ({speed_desc}), "
+        f"and the coating efficiency (g-ratio) is {g:.2f}. "
+        f"These findings place you in the {phase.lower()} stage of life, when the myelin coating "
+        f"naturally peaks in adulthood and then gradually changes with age. "
+        f"Overall, the results are consistent with expected changes for the {phase.lower()} period. "
+        f"We recommend maintaining healthy lifestyle habits that support brain and nerve health "
+        f"(such as regular activity, good sleep, and managing inflammation if it rises) "
+        f"and following up with your physician if symptoms change. "
+        f"This educational analysis is not a substitute for personal medical advice from a qualified doctor."
+    )
+    notes = []
+    if data.get("dev_history"):
+        notes.append(f"Hypothetical developmental history note: {data['dev_history']}")
+    if data.get("behavior_obs"):
+        notes.append(f"Hypothetical behavioral observation note: {data['behavior_obs']}")
+    if data.get("ados2_note"):
+        notes.append(f"Hypothetical ADOS-2 related note: {data['ados2_note']}")
+    if data.get("adir_note"):
+        notes.append(f"Hypothetical ADI-R related note: {data['adir_note']}")
+    if notes:
+        summary += (
+            "\n\n--- Optional Hypothetical / Educational Notes (not clinical, do not affect myelin calculations) ---\n"
+            + "\n".join(notes)
+            + "\n\nWARNING: These notes or scores are user-entered hypothetical examples only. "
+            "They are for educational illustration and are not clinical assessments, scores, or diagnoses."
+        )
+    return summary
+
+def compute_chart_engagements(data):
+    """Compute area under/over curve and point values for verbose chart interface."""
+    ages = list(range(1, 101, 2))
+    thicks = []
+    for a in ages:
+        t, _, _, _ = myelin_metrics(a, data['ph'], data['horm'], data['id_flag'], data['ca'], data['cyto'])
+        thicks.append(t)
+    # Trapezoidal area under curve
+    area_under = sum((thicks[i] + thicks[i+1]) / 2 * (ages[i+1] - ages[i]) for i in range(len(ages)-1))
+    baseline = 100.0  # reference
+    area_over = sum(max(0, (thicks[i] + thicks[i+1]) / 2 - baseline) * (ages[i+1] - ages[i]) for i in range(len(ages)-1))
+    # Value at current age (interpolate)
+    age = data['age']
+    if age <= ages[0]:
+        val_at = thicks[0]
+    elif age >= ages[-1]:
+        val_at = thicks[-1]
+    else:
+        for i in range(len(ages)-1):
+            if ages[i] <= age <= ages[i+1]:
+                frac = (age - ages[i]) / (ages[i+1] - ages[i])
+                val_at = thicks[i] + frac * (thicks[i+1] - thicks[i])
+                break
+        else:
+            val_at = thicks[-1]
+    return {
+        "area_under": area_under,
+        "area_over": area_over,
+        "value_at_current": val_at,
+        "ages": ages,
+        "thicks": thicks
+    }
+
+def generate_charts(data, timestamp):
+    """Generate chart PNGs and return list of paths."""
+    if not HAS_MPL:
+        return []
+    paths = []
+    age = data['age']
+    ph = data['ph']
+    horm = data['horm']
+    id_flag = data['id_flag']
+    ca = data['ca']
+    cyto = data['cyto']
+
+    # Age sweep chart
+    ages = list(range(1, 101, 2))
+    thicks, deltas, vels = [], [], []
+    for a in ages:
+        t, d, g, v = myelin_metrics(a, ph, horm, id_flag, ca, cyto)
+        thicks.append(t)
+        deltas.append(d)
+        vels.append(v)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(ages, thicks, label="Thickness (nm)", color="#4fc3f7")
+    ax.axvline(age, color="red", linestyle="--", label=f"Current age {age:.0f}")
+    ax.axhline(100, color="gray", linestyle=":", alpha=0.5, label="Baseline 100 nm")
+    ax.set_xlabel("Age (years)")
+    ax.set_ylabel("Myelin Thickness (nm)")
+    ax.set_title("Myelin Thickness Across Lifespan")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    p1 = os.path.join(REPORT_DIR, "Featured_thickness_sweep.png")
+    fig.tight_layout()
+    fig.savefig(p1, dpi=120)
+    plt.close(fig)
+    paths.append(p1)
+
+    # 3D sphere snapshot
+    fig = plt.figure(figsize=(5, 5))
+    ax = fig.add_subplot(111, projection="3d")
+    u = [i * math.pi / 18 for i in range(19)]
+    v = [i * 2 * math.pi / 18 for i in range(19)]
+    xs, ys, zs = [], [], []
+    for uu in u:
+        for vv in v:
+            xs.append(math.sin(uu) * math.cos(vv))
+            ys.append(math.sin(uu) * math.sin(vv))
+            zs.append(math.cos(uu))
+    ax.plot(xs, ys, zs, color="#222", alpha=0.25, linewidth=0.3)
+    theta = (age / 100.0) * math.pi
+    phi = (ph - 7.2) * 4.0 * math.pi
+    r = 1.0 + 0.006 * data['delta']
+    px = r * math.sin(theta) * math.cos(phi)
+    py = r * math.sin(theta) * math.sin(phi)
+    pz = r * math.cos(theta)
+    ax.scatter([px], [py], [pz], c="#e74c3c", s=80)
+    ax.set_title("Spherical Embedding")
+    p2 = os.path.join(REPORT_DIR, "Featured_sphere.png")
+    fig.tight_layout()
+    fig.savefig(p2, dpi=120)
+    plt.close(fig)
+    paths.append(p2)
+    return paths
+
+def generate_pdf(data, summary, chart_paths, timestamp):
+    if not HAS_RL:
+        return None
+    pdf_path = os.path.join(REPORT_DIR, "Featured_discharge_summary.pdf")
+    doc = SimpleDocTemplate(pdf_path, pagesize=letter, rightMargin=72, leftMargin=72, topMargin=72, bottomMargin=72)
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="BodyJust", parent=styles["Normal"], alignment=4, spaceAfter=10))
+    story = []
+    story.append(Paragraph("Educational Myelin & Neuroinflammation Report", styles["Title"]))
+    story.append(Spacer(1, 12))
+    story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", styles["Normal"]))
+    story.append(Spacer(1, 12))
+    story.append(Paragraph("<b>Plain-Language Discharge Summary</b>", styles["Heading2"]))
+    for para in summary.split("\n\n"):
+        story.append(Paragraph(para.replace("\n", "<br/>"), styles["BodyJust"]))
+    story.append(Spacer(1, 12))
+    story.append(Paragraph("<b>Key Metrics</b>", styles["Heading2"]))
+    metrics = [
+        ["Metric", "Value"],
+        ["Age", f"{data['age']:.1f} years"],
+        ["Phase", data['phase']],
+        ["Thickness", f"{data['thick']:.1f} nm"],
+        ["Delta", f"{data['delta']:.1f} nm"],
+        ["g-ratio", f"{data['g']:.3f}"],
+        ["Velocity", f"{data['vel']:.1f} m/s"],
+        ["Cytokines", f"{data['cyto']:.1f} pg/mL"],
+        ["Calcium", f"{data['ca']:.2f} mmol/L"],
+    ]
+    tbl = Table(metrics, colWidths=[2.5*inch, 3*inch])
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.lightblue),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+    ]))
+    story.append(tbl)
+    if chart_paths:
+        story.append(Spacer(1, 18))
+        story.append(Paragraph("<b>Charts</b>", styles["Heading2"]))
+        for cp in chart_paths:
+            if os.path.exists(cp):
+                story.append(Spacer(1, 6))
+                story.append(Image(cp, width=5.5*inch, height=2.8*inch))
+    story.append(Spacer(1, 18))
+    story.append(Paragraph(
+        "<i>This report is generated for educational and illustrative purposes only. "
+        "It is not a clinical diagnosis, medical advice, or substitute for professional evaluation.</i>",
+        styles["Italic"]
+    ))
+    doc.build(story)
+    return pdf_path
+
+def generate_notes(data, summary, timestamp):
+    notes_path = os.path.join(REPORT_DIR, "Featured_notes.txt")
+    with open(notes_path, "w", encoding="utf-8") as f:
+        f.write(f"Myelin Analysis Notes — {timestamp}\n")
+        f.write("=" * 40 + "\n\n")
+        f.write(summary)
+        f.write("\n\n--- Raw Metrics ---\n")
+        for k, v in data.items():
+            if k not in ("nn",):
+                f.write(f"{k}: {v}\n")
+    return notes_path
+
+class ChatMyelinGUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Myelin AI Analyzer — Chat Interface")
+        self.geometry("1100x800")
+        self.minsize(900, 600)
+        self.dark_mode = True
+        self.configure(bg="#1e1e1e")
+        self.style = ttk.Style()
+        self.style.theme_use("clam")
+        self.vars = {}
+        self.last = {}
+        self._build_ui()
+        self.apply_theme()
+        self.append_message("assistant", "Hello! I'm your educational myelin & neuroinflammation analyzer.\n\n"
+                             "Adjust the settings on the left, then type a prompt or click Analyze / Send.\n"
+                             "I'll generate a plain-language summary plus PDF, notes, and chart files with clickable links and thumbnails.")
+
+    def _build_ui(self):
+        # Main paned window: sidebar + chat
+        paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True)
+
+        # Left sidebar
+        sidebar = ttk.Frame(paned, width=320)
+        paned.add(sidebar, weight=0)
+
+        ttk.Label(sidebar, text="Settings", style="Header.TLabel").pack(pady=6)
+        filter_frame = ttk.LabelFrame(sidebar, text="Filters", padding=6)
+        filter_frame.pack(fill=tk.X, padx=6, pady=4)
+
+        core = [
+            ("Age", "age", ["0","9","18","32","50","66","80","90"]),
+            ("pH", "ph", ["7.2","7.35","7.40","7.45","7.5"]),
+            ("Hormone", "horm", ["0.6","0.8","1.0","1.2","1.4"]),
+            ("Ca", "ca", ["1.0","1.2","1.4","1.6"]),
+            ("Cyto", "cyto", ["10","15","30","60","100"]),
+            ("ID", "id", ["0","1"]),
+        ]
+        for i, (lab, key, vals) in enumerate(core):
+            ttk.Label(filter_frame, text=lab).grid(row=i, column=0, sticky="w", padx=2)
+            var = tk.StringVar(value=DEFAULTS.get(key, vals[0]))
+            cb = ttk.Combobox(filter_frame, textvariable=var, values=vals, width=10, state="readonly")
+            cb.grid(row=i, column=1, padx=2, pady=1)
+            self.vars[key] = var
+
+        clinical = [
+            ("Sex", "sex", ["Female", "Male", "Other"]),
+            ("Thyroid", "thyroid", ["Euthyroid", "Hypothyroid", "Hyperthyroid"]),
+            ("Symptom", "symptom", ["None", "Cognitive slowing", "Memory complaint", "Fatigue"]),
+            ("Myelination", "myelination", ["Age-appropriate", "Delayed", "Hypomyelination"]),
+            ("Inflammation", "inflammation", ["None", "Low", "Moderate", "High"]),
+            ("Cognitive", "cognitive", ["Intact", "Mild impairment", "Moderate impairment"]),
+        ]
+        for i, (lab, key, vals) in enumerate(clinical):
+            ttk.Label(filter_frame, text=lab).grid(row=i+6, column=0, sticky="w", padx=2)
+            var = tk.StringVar(value=DEFAULTS.get(key, vals[0]))
+            cb = ttk.Combobox(filter_frame, textvariable=var, values=vals, width=14, state="readonly")
+            cb.grid(row=i+6, column=1, padx=2, pady=1)
+            self.vars[key] = var
+
+        # Notes
+        notes_frame = ttk.LabelFrame(sidebar, text="Optional Notes (hypothetical only)", padding=4)
+        notes_frame.pack(fill=tk.X, padx=6, pady=4)
+        ttk.Label(notes_frame, text="Dev history:").pack(anchor="w")
+        self.dev_history = tk.Entry(notes_frame, width=30)
+        self.dev_history.pack(fill=tk.X, pady=1)
+        ttk.Label(notes_frame, text="Behavior obs:").pack(anchor="w")
+        self.behavior_obs = tk.Entry(notes_frame, width=30)
+        self.behavior_obs.pack(fill=tk.X, pady=1)
+        ttk.Label(notes_frame, text="ADOS-2 note:").pack(anchor="w")
+        self.ados2_note = tk.Entry(notes_frame, width=30)
+        self.ados2_note.pack(fill=tk.X, pady=1)
+        ttk.Label(notes_frame, text="ADI-R note:").pack(anchor="w")
+        self.adir_note = tk.Entry(notes_frame, width=30)
+        self.adir_note.pack(fill=tk.X, pady=1)
+
+        btn_box = ttk.Frame(sidebar)
+        btn_box.pack(fill=tk.X, padx=6, pady=6)
+        ttk.Button(btn_box, text="Analyze", command=self.run_analysis).pack(fill=tk.X, pady=2)
+        ttk.Button(btn_box, text="Clear Chat", command=self.clear_chat).pack(fill=tk.X, pady=2)
+        ttk.Button(btn_box, text="Toggle Theme", command=self.toggle_theme).pack(fill=tk.X, pady=2)
+        ttk.Button(btn_box, text="Open Reports Folder", command=self.open_reports).pack(fill=tk.X, pady=2)
+
+        # Right chat area
+        chat_frame = ttk.Frame(paned)
+        paned.add(chat_frame, weight=1)
+
+        self.chat = scrolledtext.ScrolledText(chat_frame, font=("Segoe UI", 10), wrap=tk.WORD,
+                                               state="disabled", padx=10, pady=10, spacing1=4, spacing3=6)
+        self.chat.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        # Bubble-like tags
+        self.chat.tag_config("in_label", foreground="#4fc3f7", font=("Segoe UI", 9, "bold"), justify="right")
+        self.chat.tag_config("out_label", foreground="#81c784", font=("Segoe UI", 9, "bold"))
+        self.chat.tag_config("in_bubble", background="#1e3a5f", foreground="#e0e0e0", lmargin1=120, lmargin2=120, rmargin=20, spacing1=2, spacing3=2)
+        self.chat.tag_config("out_bubble", background="#2d2d2d", foreground="#e0e0e0", lmargin1=20, lmargin2=20, rmargin=80, spacing1=2, spacing3=2)
+        self.chat.tag_config("system", foreground="#aaaaaa", font=("Segoe UI", 9, "italic"), lmargin1=40)
+        self.chat.tag_config("link", foreground="#64b5f6", underline=True)
+        self.chat.tag_config("copy_btn", foreground="#ffb74d", underline=True, font=("Segoe UI", 8))
+
+        # Store images to prevent GC
+        self.photo_refs = []
+
+        input_frame = ttk.Frame(chat_frame)
+        input_frame.pack(fill=tk.X, padx=4, pady=4)
+        self.prompt = tk.Entry(input_frame, font=("Segoe UI", 11))
+        self.prompt.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        self.prompt.insert(0, "Type a prompt (e.g. years 66 acidity 7.4) or leave blank to use settings...")
+        self.prompt.config(fg="#888888")
+        self.prompt.bind("<FocusIn>", self._clear_placeholder)
+        self.prompt.bind("<FocusOut>", self._restore_placeholder)
+        self.prompt.bind("<Return>", lambda e: self.run_analysis())
+        self.prompt.focus_set()
+        ttk.Button(input_frame, text="Send", command=self.run_analysis).pack(side=tk.RIGHT)
+
+        # Global copy buttons
+        copy_frame = ttk.Frame(chat_frame)
+        copy_frame.pack(fill=tk.X, padx=4)
+        ttk.Button(copy_frame, text="Copy Selected", command=self.copy_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Button(copy_frame, text="Copy All Chat", command=self.copy_all).pack(side=tk.LEFT, padx=2)
+
+        self.status = ttk.Label(self, text="Ready. Reports saved to: Featured_Reports\\myelin_reports")
+        self.status.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=2)
+
+    def _clear_placeholder(self, event=None):
+        if self.prompt.get().startswith("Type a prompt"):
+            self.prompt.delete(0, tk.END)
+            self.prompt.config(fg="#ffffff" if self.dark_mode else "#212121")
+
+    def _restore_placeholder(self, event=None):
+        if not self.prompt.get().strip():
+            self.prompt.insert(0, "Type a prompt (e.g. years 66 acidity 7.4) or leave blank to use settings...")
+            self.prompt.config(fg="#888888")
+
+    def copy_selected(self):
+        try:
+            text = self.chat.get(tk.SEL_FIRST, tk.SEL_LAST)
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.status.config(text="Selected text copied.")
+        except tk.TclError:
+            self.status.config(text="No text selected.")
+
+    def copy_all(self):
+        text = self.chat.get(1.0, tk.END)
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.status.config(text="Entire chat copied.")
+
+    def open_file(self, path):
+        try:
+            os.startfile(path)
+        except Exception:
+            try:
+                import subprocess
+                subprocess.Popen(["xdg-open", path])
+            except Exception:
+                messagebox.showinfo("Open", f"File: {path}")
+
+    def show_lightbox(self, path):
+        """Modal lightbox showing a larger version of the resource thumbnail."""
+        if not os.path.exists(path):
+            messagebox.showwarning("Lightbox", "File not found.")
+            return
+        modal = tk.Toplevel(self)
+        modal.title(f"Full Size View — {os.path.basename(path)}")
+        modal.transient(self)
+        modal.grab_set()  # modal
+        modal.configure(bg="#111111")
+        # Center it
+        modal.geometry("800x600")
+        modal.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() // 2) - 400
+        y = self.winfo_y() + (self.winfo_height() // 2) - 300
+        modal.geometry(f"+{max(0,x)}+{max(0,y)}")
+
+        try:
+            from PIL import Image as PILImage, ImageTk
+            img = PILImage.open(path)
+            # Scale to fit nicely
+            max_w, max_h = 760, 520
+            img.thumbnail((max_w, max_h), PILImage.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            # Keep reference
+            modal.photo = photo
+            lbl = tk.Label(modal, image=photo, bg="#111111")
+            lbl.pack(expand=True, pady=10)
+        except Exception as e:
+            tk.Label(modal, text=f"Could not load image:\n{e}", fg="white", bg="#111111").pack(expand=True)
+
+        btn_frame = tk.Frame(modal, bg="#111111")
+        btn_frame.pack(pady=8)
+        tk.Button(btn_frame, text="Open Full File", command=lambda: self.open_file(path)).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_frame, text="Download", command=lambda: self._download_file(path, modal)).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_frame, text="Close", command=modal.destroy).pack(side=tk.LEFT, padx=6)
+        modal.bind("<Escape>", lambda e: modal.destroy())
+        modal.focus_set()
+
+    def _download_file(self, path, parent=None):
+        """Save a copy of the resource via file dialog."""
+        if not os.path.exists(path):
+            messagebox.showwarning("Download", "Source file not found.", parent=parent)
+            return
+        base = os.path.basename(path)
+        name, ext = os.path.splitext(base)
+        dest = filedialog.asksaveasfilename(
+            parent=parent,
+            title="Download resource",
+            initialfile=base,
+            defaultextension=ext,
+            filetypes=[("All files", "*.*"), ("Images", "*.png *.jpg *.jpeg"), ("PDF", "*.pdf"), ("Text", "*.txt")]
+        )
+        if dest:
+            try:
+                import shutil
+                shutil.copy2(path, dest)
+                messagebox.showinfo("Download", f"Saved to:\n{dest}", parent=parent)
+                self.status.config(text=f"Downloaded: {os.path.basename(dest)}")
+            except Exception as e:
+                messagebox.showerror("Download", str(e), parent=parent)
+
+    def append_message(self, role, text, files=None):
+        self.chat.config(state="normal")
+        if role == "user":
+            self.chat.insert(tk.END, "In: ", "in_label")
+            self.chat.insert(tk.END, text + "\n", "in_bubble")
+        elif role == "assistant":
+            self.chat.insert(tk.END, "Out: ", "out_label")
+            self.chat.insert(tk.END, text + "\n", "out_bubble")
+            # Add per-message copy tag
+            start = self.chat.index("end-2c linestart")
+            self.chat.insert(tk.END, " [Copy this] ", "copy_btn")
+            self.chat.tag_bind("copy_btn", "<Button-1>", lambda e, t=text: self._copy_text(t))
+        else:
+            self.chat.insert(tk.END, text + "\n", "system")
+        # Files as clickable links + thumbnails if images
+        if files:
+            for fpath, label in files:
+                if not os.path.exists(fpath):
+                    continue
+                self.chat.insert(tk.END, f"  • {label}: ", "system")
+                link_tag = f"link_{id(fpath)}"
+                self.chat.tag_config(link_tag, foreground="#64b5f6", underline=True)
+                self.chat.insert(tk.END, os.path.basename(fpath), link_tag)
+                self.chat.tag_bind(link_tag, "<Button-1>", lambda e, p=fpath: self.open_file(p))
+                # Download button/link next to the full file
+                dl_tag = f"dl_{id(fpath)}"
+                self.chat.tag_config(dl_tag, foreground="#ffb74d", underline=True)
+                self.chat.insert(tk.END, " [Download]", dl_tag)
+                self.chat.tag_bind(dl_tag, "<Button-1>", lambda e, p=fpath: self._download_file(p))
+                self.chat.insert(tk.END, " (click name to open, or Download)\n", "system")
+                # Thumbnail for PNGs — click opens lightbox modal
+                if fpath.lower().endswith((".png", ".jpg", ".jpeg")) and HAS_MPL:
+                    try:
+                        from PIL import Image as PILImage, ImageTk
+                        img = PILImage.open(fpath)
+                        img.thumbnail((180, 120))
+                        photo = ImageTk.PhotoImage(img)
+                        self.photo_refs.append(photo)
+                        thumb_tag = f"thumb_{id(fpath)}"
+                        self.chat.tag_config(thumb_tag)
+                        self.chat.insert(tk.END, " ")  # anchor
+                        start = self.chat.index(tk.END)
+                        self.chat.image_create(tk.END, image=photo)
+                        end = self.chat.index(tk.END)
+                        self.chat.tag_add(thumb_tag, start, end)
+                        self.chat.tag_bind(thumb_tag, "<Button-1>", lambda e, p=fpath: self.show_lightbox(p))
+                        self.chat.insert(tk.END, " (click thumbnail to open full size view)\n", "system")
+                    except Exception:
+                        pass  # PIL may not be present
+        self.chat.insert(tk.END, "\n")
+        self.chat.config(state="disabled")
+        self.chat.see(tk.END)
+
+    def _copy_text(self, text):
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.status.config(text="Message copied.")
+
+    def apply_theme(self):
+        if self.dark_mode:
+            bg, fg, entry_bg, entry_fg, chat_bg, chat_fg = "#1e1e1e", "#e0e0e0", "#2d2d2d", "#ffffff", "#1a1a1a", "#e8e8e8"
+            header_fg = "#4fc3f7"
+        else:
+            bg, fg, entry_bg, entry_fg, chat_bg, chat_fg = "#f5f5f5", "#212121", "#ffffff", "#212121", "#ffffff", "#212121"
+            header_fg = "#1565c0"
+        self.configure(bg=bg)
+        s = self.style
+        s.configure("TFrame", background=bg)
+        s.configure("TLabel", background=bg, foreground=fg)
+        s.configure("Header.TLabel", font=("Segoe UI", 12, "bold"), foreground=header_fg)
+        s.configure("TLabelframe", background=bg, foreground=fg)
+        s.configure("TLabelframe.Label", background=bg, foreground=fg)
+        if hasattr(self, "prompt"):
+            self.prompt.configure(bg=entry_bg, fg=entry_fg, insertbackground=entry_fg)
+        if hasattr(self, "chat"):
+            self.chat.configure(bg=chat_bg, fg=chat_fg)
+            self.chat.tag_config("in_label", foreground=header_fg)
+            self.chat.tag_config("out_label", foreground="#81c784" if self.dark_mode else "#2e7d32")
+            self.chat.tag_config("in_bubble", background="#1e3a5f" if self.dark_mode else "#e3f2fd", foreground=chat_fg)
+            self.chat.tag_config("out_bubble", background="#2d2d2d" if self.dark_mode else "#f5f5f5", foreground=chat_fg)
+        for e in (getattr(self, "dev_history", None), getattr(self, "behavior_obs", None),
+                  getattr(self, "ados2_note", None), getattr(self, "adir_note", None)):
+            if e:
+                e.configure(bg=entry_bg, fg=entry_fg, insertbackground=entry_fg)
+
+    def toggle_theme(self):
+        self.dark_mode = not self.dark_mode
+        self.apply_theme()
+        self.status.config(text=f"{'Dark' if self.dark_mode else 'Light'} mode")
+
+    def clear_chat(self):
+        self.chat.config(state="normal")
+        self.chat.delete(1.0, tk.END)
+        self.chat.config(state="disabled")
+        self.append_message("system", "Chat cleared.")
+
+    def open_reports(self):
+        try:
+            os.startfile(REPORT_DIR)  # Windows
+        except Exception:
+            try:
+                import subprocess
+                subprocess.Popen(["xdg-open", REPORT_DIR])  # Linux
+            except Exception:
+                messagebox.showinfo("Reports", f"Reports folder:\n{REPORT_DIR}")
+
+    def run_analysis(self):
+        try:
+            user_text = self.prompt.get().strip()
+            if not user_text or user_text.startswith("Type a prompt"):
+                user_text = f"years {self.vars['age'].get()} acidity {self.vars['ph'].get()} thyroid {self.vars['horm'].get()}"
+            # Check for chart query like "value at 45"
+            m = re.search(r'value at\s+([-+]?\d*\.?\d+)', user_text.lower())
+            if m and self.last:
+                query_age = float(m.group(1))
+                eng = compute_chart_engagements(self.last)
+                # simple nearest
+                ages = eng['ages']
+                thicks = eng['thicks']
+                if query_age <= ages[0]:
+                    qval = thicks[0]
+                elif query_age >= ages[-1]:
+                    qval = thicks[-1]
+                else:
+                    for i in range(len(ages)-1):
+                        if ages[i] <= query_age <= ages[i+1]:
+                            frac = (query_age - ages[i]) / (ages[i+1] - ages[i])
+                            qval = thicks[i] + frac * (thicks[i+1] - thicks[i])
+                            break
+                    else:
+                        qval = thicks[-1]
+                self.append_message("user", user_text)
+                self.append_message("assistant", f"Thickness at age {query_age:.1f}: {qval:.1f} nm (interpolated from lifespan curve).")
+                self.prompt.delete(0, tk.END)
+                self._restore_placeholder()
+                return
+            self.append_message("user", user_text)
+            self.prompt.delete(0, tk.END)
+            self._restore_placeholder()
+
+            age, ph, horm, id_flag, ca, cyto = parse_prompt(user_text)
+            try:
+                age = float(self.vars["age"].get())
+                ph = float(self.vars["ph"].get())
+                horm = float(self.vars["horm"].get())
+                ca = float(self.vars["ca"].get())
+                cyto = float(self.vars["cyto"].get())
+                id_flag = int(self.vars["id"].get())
+            except Exception:
+                pass
+
+            phase, scale = get_phase(age)
+            thick, delta, g, vel = myelin_metrics(age, ph, horm, id_flag, ca, cyto)
+            nn = nn_forward(age, ph, horm, id_flag, ca, cyto, scale)
+            self.last = dict(
+                age=age, ph=ph, horm=horm, id_flag=id_flag, ca=ca, cyto=cyto,
+                phase=phase, scale=scale, thick=thick, delta=delta, g=g, vel=vel, nn=nn,
+                sex=self.vars["sex"].get(), thyroid=self.vars["thyroid"].get(),
+                symptom=self.vars["symptom"].get(), myelination=self.vars["myelination"].get(),
+                inflammation=self.vars["inflammation"].get(), cognitive=self.vars["cognitive"].get(),
+                dev_history=self.dev_history.get().strip(),
+                behavior_obs=self.behavior_obs.get().strip(),
+                ados2_note=self.ados2_note.get().strip(),
+                adir_note=self.adir_note.get().strip()
+            )
+            summary = generate_discharge_summary(self.last)
+            self.append_message("assistant", summary)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            clear_report_dir()
+            chart_paths = generate_charts(self.last, timestamp)
+            notes_path = generate_notes(self.last, summary, timestamp)
+            pdf_path = generate_pdf(self.last, summary, chart_paths, timestamp) if HAS_RL else None
+
+            files = []
+            if notes_path:
+                files.append((notes_path, "Notes"))
+            if pdf_path:
+                files.append((pdf_path, "PDF Report"))
+            for cp in chart_paths:
+                files.append((cp, "Chart"))
+            # Add containing folder link
+            folder_link_tag = "folder_link"
+            self.chat.config(state="normal")
+            self.chat.insert(tk.END, "  • Containing folder: ", "system")
+            self.chat.tag_config(folder_link_tag, foreground="#64b5f6", underline=True)
+            self.chat.insert(tk.END, "Featured_Reports\\myelin_reports", folder_link_tag)
+            self.chat.tag_bind(folder_link_tag, "<Button-1>", lambda e: self.open_reports())
+            self.chat.insert(tk.END, " (click to open containing folder)\n", "system")
+            self.chat.config(state="disabled")
+            self.append_message("system", "Generated files (click names to open; thumbnails open full-size lightbox; [Download] saves a copy):", files=files)
+
+            # Verbose chart engagements
+            eng = compute_chart_engagements(self.last)
+            verbose = (
+                f"Chart Engagements (verbose):\n"
+                f"• Area under thickness curve (age 1–100): {eng['area_under']:.0f} nm·years\n"
+                f"• Area over 100 nm baseline: {eng['area_over']:.0f} nm·years\n"
+                f"• Thickness value at current age ({self.last['age']:.1f}): {eng['value_at_current']:.1f} nm\n"
+                f"You can ask in chat for a value at another age (e.g. 'value at 45')."
+            )
+            self.append_message("assistant", verbose)
+            self.status.config(text=f"Analysis complete. Reports in {REPORT_DIR}")
+        except Exception as e:
+            self.append_message("system", f"Error: {e}")
+            messagebox.showerror("Error", str(e))
+
+if __name__ == "__main__":
+    ChatMyelinGUI().mainloop()
