@@ -28,3 +28,39 @@ It enables dynamic parameter tuning, visual insight generation, and automated **
 ```bash
 git clone https://github.com/yourname/myelin-ai-analyzer.git
 cd myelin-ai-analyzer
+
+                    +----------------------+
+                    |  Web Client (Browser)|
+                    |  - Chat UI           |
+                    |  - Parameter Panel   |
+                    |  - Visualization     |
+                    +----------+-----------+
+                               |
+                               | WebSocket / REST
+                               |
+                    +----------v-----------+
+                    |  Frontend Server     |
+                    |  - Static assets     |
+                    |  - API proxy         |
+                    +----------+-----------+
+                               |
+                +--------------+--------------+
+                |                             |
+    +-----------v-----------+       +---------v---------+
+    |  Analysis Service     |       |  Report Service    |
+    |  - Prompt handling    |       |  - Featured_ PDF   |
+    |  - Parameter parsing  |       |  - Templates       |
+    |  - Job queue          |       |  - Export storage  |
+    +-----------+-----------+       +---------+---------+
+                |                             |
+    +-----------v-----------+       +---------v---------+
+    |  AI Inference Layer   |       |  Storage / DB     |
+    |  - External AI API    |       |  - Results        |
+    |  - Local model server |       |  - Reports        |
+    +-----------+-----------+       +-------------------+
+                |
+    +-----------v-----------+
+    |  Monitoring & Auth    |
+    |  - Metrics            |
+    |  - API keys / Secrets |
+    +-----------------------+
